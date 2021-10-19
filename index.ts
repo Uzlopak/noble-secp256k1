@@ -24,17 +24,9 @@ const CURVE = {
 export { CURVE };
 
 // y² = x³ + ax + b: Short weistrass curve formula. Returns y²
-const weistrass = (() => {
-  if (CURVE.a) {
-    return (x: bigint, b = CURVE.b, a = CURVE.a) => {
-      return mod(x ** 3n + a * x + b);
-    }
-  } else {
-    return (x: bigint, b = CURVE.b) => {
-      return mod(x ** 3n + b);
-    }
-  }
-})();
+function weistrass(x: bigint, b = CURVE.b, a = CURVE.a,) {
+  return mod(x ** 3n + a * x + b);
+}
 
 type Hex = Uint8Array | string;
 type PrivKey = Hex | bigint | number;
@@ -50,7 +42,7 @@ type Sig = Hex | Signature;
 // Should always be used for Jacobian's double-and-add multiplication.
 // For affines cached multiplication, it trades off 1/2 init time & 1/3 ram for 20% perf hit.
 // https://gist.github.com/paulmillr/eb670806793e84df628a7c434a873066
-const USE_ENDOMORPHISM = CURVE.a === 0n && typeof CURVE.beta === "bigint";
+const USE_ENDOMORPHISM = CURVE.a === 0n;
 
 // Default Point works in 2d / affine coordinates: (x, y)
 // Jacobian Point works in 3d / jacobi coordinates: (x, y, z) ∋ (x=x/z², y=y/z³)
@@ -71,8 +63,15 @@ class JacobianPoint {
   // invert on all of them. invert is very slow operation,
   // so this improves performance massively.
   static toAffineBatch(points: JacobianPoint[]): Point[] {
-    const toInv = invertBatch(points.map((p) => p.z));
-    return points.map((p, i) => p.toAffine(toInv[i]));
+    const toInv: (bigint | Point)[] = [];
+    for (let i = 0, il = points.length; i < il; i++) {
+      toInv.push(points[i].z);
+    }
+    invertBatch(toInv as bigint[]);
+    for (let i = 0, il = toInv.length; i < il; i++) {
+      toInv[i] = (points[i].toAffine(toInv[i] as bigint) as Point);
+    }
+    return toInv as Point[];
   }
 
   static normalizeZ(points: JacobianPoint[]): JacobianPoint[] {
@@ -106,7 +105,7 @@ class JacobianPoint {
     const A = mod(X1 ** 2n);
     const B = mod(Y1 ** 2n);
     const C = mod(B ** 2n);
-    const D = mod(4n * X1 * B);
+    const D = mod(2n * (mod(mod((X1 + B) ** 2n)) - A - C));
     const E = mod(3n * A);
     const F = mod(E ** 2n);
     const X3 = mod(F - 2n * D);
@@ -124,20 +123,20 @@ class JacobianPoint {
     if (!(other instanceof JacobianPoint)) {
       throw new TypeError('JacobianPoint#add: expected JacobianPoint');
     }
+    const X1 = this.x;
+    const Y1 = this.y;
+    const Z1 = this.z;
     const X2 = other.x;
     const Y2 = other.y;
     const Z2 = other.z;
     if (X2 === 0n || Y2 === 0n) return this;
-    const X1 = this.x;
-    const Y1 = this.y;
-    const Z1 = this.z;
     if (X1 === 0n || Y1 === 0n) return other;
-    const Z1Z1 = mod(Z1 ** 2n);
-    const Z2Z2 = mod(Z2 ** 2n);
-    const U1 = mod(X1 * Z2Z2);
-    const U2 = mod(X2 * Z1Z1);
-    const S1 = mod(Y1 * Z2 * Z2Z2);
-    const S2 = mod(Y2 * Z1 * Z1Z1);
+    const Z1Z1 = (Z1 ** 2n) % CURVE.P;
+    const Z2Z2 = (Z2 ** 2n) % CURVE.P;
+    const U1 = (X1 * Z2Z2) % CURVE.P;
+    const U2 = (X2 * Z1Z1) % CURVE.P;
+    const S1 = (Y1 * Z2 * Z2Z2) % CURVE.P;
+    const S2 = (((Y2 * Z1) % CURVE.P) * Z1Z1) % CURVE.P;
     const H = mod(U2 - U1);
     const r = mod(S2 - S1);
     // H = 0 meaning it's the same point.
@@ -148,12 +147,12 @@ class JacobianPoint {
         return JacobianPoint.ZERO;
       }
     }
-    const HH = mod(H ** 2n);
-    const HHH = mod(H * HH);
-    const V = mod(U1 * HH);
+    const HH = (H ** 2n) % CURVE.P;
+    const HHH = (H * HH) % CURVE.P;
+    const V = (U1 * HH) % CURVE.P;
     const X3 = mod(r ** 2n - HHH - 2n * V);
     const Y3 = mod(r * (V - X3) - S1 * HHH);
-    const Z3 = mod(Z1 * Z2 * H);
+    const Z3 = (Z1 * Z2 * H) % CURVE.P;
     return new JacobianPoint(X3, Y3, Z3);
   }
 
@@ -208,7 +207,7 @@ class JacobianPoint {
     for (let window = 0; window < windows; window++) {
       base = p;
       points.push(base);
-      for (let i = 1; i < 2 ** (W - 1); i++) {
+      for (let i = 1, il = 2 ** (W - 1); i < il; i++) {
         base = base.add(p);
         points.push(base);
       }
@@ -390,6 +389,7 @@ export class Point {
   static fromSignature(msgHash: Hex, signature: Sig, recovery: number): Point {
     let h: bigint = msgHash instanceof Uint8Array ? bytesToNumber(msgHash) : hexToNumber(msgHash);
     const sig = normalizeSignature(signature);
+    sig.assertValidity();
     const { r, s } = sig;
     if (recovery !== 0 && recovery !== 1) {
       throw new Error('Cannot recover signature: invalid yParity bit');
@@ -397,7 +397,7 @@ export class Point {
     const prefix = 2 + (recovery & 1);
     const P_ = Point.fromHex(`0${prefix}${pad64(r)}`);
     const sP = JacobianPoint.fromAffine(P_).multiplyUnsafe(s);
-    const hG = JacobianPoint.BASE.multiplyUnsafe(h);
+    const hG = JacobianPoint.BASE.multiply(h);
     const rinv = invert(r, CURVE.n);
     const Q = sP.subtract(hG).multiplyUnsafe(rinv);
     const point = Q.toAffine();
@@ -430,12 +430,10 @@ export class Point {
   // A point on curve is valid if it conforms to equation.
   assertValidity(): void {
     const msg = 'Point is not on elliptic curve';
-    const { P } = CURVE;
-    const { x, y } = this;
-    if (x === 0n || y === 0n || x >= P || y >= P) throw new Error(msg);
-    const left = mod(y * y);
-    const right = weistrass(x);
-    if ((left - right) % P !== 0n) throw new Error(msg);
+    if (this.x === 0n || this.y === 0n || this.x >= CURVE.P || this.y >= CURVE.P) throw new Error(msg);
+    const left = mod(this.y * this.y);
+    const right = weistrass(this.x);
+    if ((left - right) % CURVE.P !== 0n) throw new Error(msg);
   }
 
   equals(other: Point): boolean {
@@ -477,81 +475,67 @@ function sliceDer(s: string): string {
 export class Signature {
   constructor(public r: bigint, public s: bigint) { }
 
-  // pair (32 bytes of r, 32 bytes of s)
-  static fromCompact(hex: Hex) {
-    if (typeof hex !== 'string' && !(hex instanceof Uint8Array)) {
-      throw new TypeError(`Signature.fromCompact: Expected string or Uint8Array`);
-    }
-    const str = hex instanceof Uint8Array ? bytesToHex(hex) : hex;
-    if (str.length !== 128) throw new Error('Signature.fromCompact: Expected 64-byte hex');
-    const sig = new Signature(hexToNumber(str.slice(0, 64)), hexToNumber(str.slice(64, 128)));
-    sig.assertValidity();
-    return sig;
-  }
-
   // DER encoded ECDSA signature
   // https://bitcoin.stackexchange.com/questions/57644/what-are-the-parts-of-a-bitcoin-transaction-input-script
-  static fromDER(hex: Hex) {
-    const fn = 'Signature.fromDER';
+  static fromHex(hex: Hex) {
     if (typeof hex !== 'string' && !(hex instanceof Uint8Array)) {
-      throw new TypeError(`${fn}: Expected string or Uint8Array`);
+      throw new TypeError(`Signature.fromHex: Expected string or Uint8Array`);
     }
     const str = hex instanceof Uint8Array ? bytesToHex(hex) : hex;
 
     // `30${length}02${rLen}${rHex}02${sLen}${sHex}`
     const length = parseByte(str.slice(2, 4));
     if (str.slice(0, 2) !== '30' || length !== str.length - 4 || str.slice(4, 6) !== '02') {
-      throw new Error(`${fn}: Invalid signature ${str}`);
+      throw new Error('Signature.fromHex: Invalid signature');
     }
 
     // r
     const rLen = parseByte(str.slice(6, 8));
     const rEnd = 8 + rLen;
     const rr = str.slice(8, rEnd);
+
+    if (rr.length !== rLen) {
+      throw new Error('Signature.fromHex: Invalid r length');
+    }
     if (rr.startsWith('00') && parseByte(rr.slice(2, 4)) <= 0x7f) {
-      throw new Error(`${fn}: Invalid r with trailing length`);
+      throw new Error('Signature.fromHex: Invalid r with trailing length');
     }
     const r = hexToNumber(rr);
 
     // s
     const separator = str.slice(rEnd, rEnd + 2);
     if (separator !== '02') {
-      throw new Error(`${fn}: Invalid r-s separator`);
+      throw new Error('Signature.fromHex: Invalid r-s separator');
     }
     const sLen = parseByte(str.slice(rEnd + 2, rEnd + 4));
     const diff = length - sLen - rLen - 10;
     if (diff > 0 || diff === -4) {
-      throw new Error(`${fn}: Invalid total length`);
+      throw new Error(`Signature.fromHex: Invalid total length`);
     }
     if (sLen > length - rLen - 4) {
-      throw new Error(`${fn}: Invalid s`);
+      throw new Error(`Signature.fromHex: Invalid s`);
     }
     const sStart = rEnd + 4;
     const ss = str.slice(sStart, sStart + sLen);
     if (ss.startsWith('00') && parseByte(ss.slice(2, 4)) <= 0x7f) {
-      throw new Error(`${fn}: Invalid s with trailing length`);
+      throw new Error(`Signature.fromHex: Invalid s with trailing length`);
     }
     const s = hexToNumber(ss);
-    const sig = new Signature(r, s);
-    sig.assertValidity();
-    return sig;
-  }
 
-  // Don't use this method
-  static fromHex(hex: Hex) {
-    return this.fromDER(hex);
+    return new Signature(r, s);
   }
 
   assertValidity(): void {
-    if (!isWithinCurveOrder(this.r)) throw new Error('Invalid Signature: r must be 0 < r < n');
-    if (!isWithinCurveOrder(this.s)) throw new Error('Invalid Signature: s must be 0 < s < n');
+    const { r, s } = this;
+    if (!isWithinCurveOrder(r)) throw new Error('Invalid Signature: r must be 0 < r < n');
+    if (!isWithinCurveOrder(s)) throw new Error('Invalid Signature: s must be 0 < s < n');
   }
 
-  // DER-encoded
-  toDERRawBytes(isCompressed = false) {
-    return hexToBytes(this.toDERHex(isCompressed));
+  toRawBytes(isCompressed = false) {
+    return hexToBytes(this.toHex(isCompressed));
   }
-  toDERHex(isCompressed = false) {
+
+  toHex(isCompressed = false) {
     const sHex = sliceDer(numberToHex(this.s));
     if (isCompressed) return sHex;
     const rHex = sliceDer(numberToHex(this.r));
@@ -559,22 +543,6 @@ export class Signature {
     const sLen = numberToHex(sHex.length >> 1);
     const length = numberToHex((rHex.length >> 1) + (sHex.length >> 1) + 4);
     return `30${length}02${rLen}${rHex}02${sLen}${sHex}`;
-  }
-
-  // Don't use these methods
-  toRawBytes() {
-    return this.toDERRawBytes();
-  }
-  toHex() {
-    return this.toDERHex();
-  }
-
-  // 32 bytes of r, then 32 bytes of s
-  toCompactRawBytes() {
-    return hexToBytes(this.toCompactHex());
-  }
-  toCompactHex() {
-    return pad64(this.r) + pad64(this.s);
   }
 }
 export const SignResult = Signature; // backwards compatibility
@@ -593,13 +561,38 @@ function concatBytes(...arrays: Uint8Array[]): Uint8Array {
   return result;
 }
 
+const preCachedByteToHex: string[] = ((): string[] => {
+  const result = [];
+  for (let i = 0; i < 256; i++) {
+    result.push(i.toString(16).padStart(2, "0"));
+  }
+  return result;
+})();
+const preCachedHexToByte: { [key: string]: bigint } = {
+  "00": 0n, "01": 1n, "02": 2n, "03": 3n, "04": 4n, "05": 5n, "06": 6n, "07": 7n, "08": 8n, "09": 9n, "0a": 10n, "0b": 11n, "0c": 12n, "0d": 13n, "0e": 14n, "0f": 15n,
+  "10": 16n, "11": 17n, "12": 18n, "13": 19n, "14": 20n, "15": 21n, "16": 22n, "17": 23n, "18": 24n, "19": 25n, "1a": 26n, "1b": 27n, "1c": 28n, "1d": 29n, "1e": 30n, "1f": 31n,
+  "20": 32n, "21": 33n, "22": 34n, "23": 35n, "24": 36n, "25": 37n, "26": 38n, "27": 39n, "28": 40n, "29": 41n, "2a": 42n, "2b": 43n, "2c": 44n, "2d": 45n, "2e": 46n, "2f": 47n,
+  "30": 48n, "31": 49n, "32": 50n, "33": 51n, "34": 52n, "35": 53n, "36": 54n, "37": 55n, "38": 56n, "39": 57n, "3a": 58n, "3b": 59n, "3c": 60n, "3d": 61n, "3e": 62n, "3f": 63n,
+  "40": 64n, "41": 65n, "42": 66n, "43": 67n, "44": 68n, "45": 69n, "46": 70n, "47": 71n, "48": 72n, "49": 73n, "4a": 74n, "4b": 75n, "4c": 76n, "4d": 77n, "4e": 78n, "4f": 79n,
+  "50": 80n, "51": 81n, "52": 82n, "53": 83n, "54": 84n, "55": 85n, "56": 86n, "57": 87n, "58": 88n, "59": 89n, "5a": 90n, "5b": 91n, "5c": 92n, "5d": 93n, "5e": 94n, "5f": 95n,
+  "60": 96n, "61": 97n, "62": 98n, "63": 99n, "64": 100n, "65": 101n, "66": 102n, "67": 103n, "68": 104n, "69": 105n, "6a": 106n, "6b": 107n, "6c": 108n, "6d": 109n, "6e": 110n, "6f": 111n,
+  "70": 112n, "71": 113n, "72": 114n, "73": 115n, "74": 116n, "75": 117n, "76": 118n, "77": 119n, "78": 120n, "79": 121n, "7a": 122n, "7b": 123n, "7c": 124n, "7d": 125n, "7e": 126n, "7f": 127n,
+  "80": 128n, "81": 129n, "82": 130n, "83": 131n, "84": 132n, "85": 133n, "86": 134n, "87": 135n, "88": 136n, "89": 137n, "8a": 138n, "8b": 139n, "8c": 140n, "8d": 141n, "8e": 142n, "8f": 143n,
+  "90": 144n, "91": 145n, "92": 146n, "93": 147n, "94": 148n, "95": 149n, "96": 150n, "97": 151n, "98": 152n, "99": 153n, "9a": 154n, "9b": 155n, "9c": 156n, "9d": 157n, "9e": 158n, "9f": 159n, 
+  "a0": 160n, "a1": 161n, "a2": 162n, "a3": 163n, "a4": 164n, "a5": 165n, "a6": 166n, "a7": 167n, "a8": 168n, "a9": 169n, "aa": 170n, "ab": 171n, "ac": 172n, "ad": 173n, "ae": 174n, "af": 175n,
+  "b0": 176n, "b1": 177n, "b2": 178n, "b3": 179n, "b4": 180n, "b5": 181n, "b6": 182n, "b7": 183n, "b8": 184n, "b9": 185n, "ba": 186n, "bb": 187n, "bc": 188n, "bd": 189n, "be": 190n, "bf": 191n, 
+  "c0": 192n, "c1": 193n, "c2": 194n, "c3": 195n, "c4": 196n, "c5": 197n, "c6": 198n, "c7": 199n, "c8": 200n, "c9": 201n, "ca": 202n, "cb": 203n, "cc": 204n, "cd": 205n, "ce": 206n, "cf": 207n, 
+  "d0": 208n, "d1": 209n, "d2": 210n, "d3": 211n, "d4": 212n, "d5": 213n, "d6": 214n, "d7": 215n, "d8": 216n, "d9": 217n, "da": 218n, "db": 219n, "dc": 220n, "dd": 221n, "de": 222n, "df": 223n, 
+  "e0": 224n, "e1": 225n, "e2": 226n, "e3": 227n, "e4": 228n, "e5": 229n, "e6": 230n, "e7": 231n, "e8": 232n, "e9": 233n, "ea": 234n, "eb": 235n, "ec": 236n, "ed": 237n, "ee": 238n, "ef": 239n, 
+  "f0": 240n, "f1": 241n, "f2": 242n, "f3": 243n, "f4": 244n, "f5": 245n, "f6": 246n, "f7": 247n, "f8": 248n, "f9": 249n, "fa": 250n, "fb": 251n, "fc": 252n, "fd": 253n, "fe": 254n, "ff": 255n
+};
 // Convert between types
 // ---------------------
 function bytesToHex(uint8a: Uint8Array): string {
   // pre-caching chars could speed this up 6x.
   let hex = '';
   for (let i = 0; i < uint8a.length; i++) {
-    hex += uint8a[i].toString(16).padStart(2, '0');
+    hex += preCachedByteToHex[uint8a[i]];
   }
   return hex;
 }
@@ -621,19 +614,31 @@ function hexToNumber(hex: string): bigint {
   if (typeof hex !== 'string') {
     throw new TypeError('hexToNumber: expected string, got ' + typeof hex);
   }
-  // Big Endian
-  return BigInt(`0x${hex}`);
+  const value = hex.toLowerCase();
+  // pre-caching chars could speed this up 6x.
+  let result = 0n;
+  for (let i = 0; i < value.length; i += 2) {
+    result = (result << 8n);
+    try{
+
+      result += preCachedHexToByte[value.substr(i, 2)] as bigint;
+    } catch (e) {
+      console.error(value.substr(i, 2))
+    }
+  }
+  return result;
 }
 
 function hexToBytes(hex: string): Uint8Array {
   if (typeof hex !== 'string') {
     throw new TypeError('hexToBytes: expected string, got ' + typeof hex);
   }
-  if (hex.length % 2) throw new Error('hexToBytes: received invalid unpadded hex');
+  if (hex.length % 2) {
+    throw new Error('hexToBytes: received invalid unpadded hex');
+  }
   const array = new Uint8Array(hex.length >> 1);
-  for (let i = 0; i < array.length; i++) {
-    const j = i << 1;
-    array[i] = Number.parseInt(hex.slice(j, j + 2), 16);
+  for (let i = 0; i < (hex.length >> 1); i++) {
+    array[i] = Number.parseInt(hex.substr(i << 1, 2), 16);
   }
   return array;
 }
@@ -668,11 +673,10 @@ function mod(a: bigint, b: bigint = CURVE.P): bigint {
 
 // Does x ^ (2 ^ power). E.g. 30 ^ (2 ^ 4)
 function pow2(x: bigint, power: bigint): bigint {
-  const { P } = CURVE;
   let res = x;
-  for (let i = 0n; i < power; i++) {
+  while (power-- > 0n) {
     res *= res;
-    res %= P;
+    res %= CURVE.P;
   }
   return res;
 }
@@ -683,20 +687,19 @@ function pow2(x: bigint, power: bigint): bigint {
 // (P+1n/4n).toString(2) would produce bits [223x 1, 0, 22x 1, 4x 0, 11, 00]
 // We are multiplying it bit-by-bit
 function sqrtMod(x: bigint): bigint {
-  const { P } = CURVE;
-  const b2 = (x * x * x) % P; // x^3, 11
-  const b3 = (b2 * b2 * x) % P; // x^7
-  const b6 = (pow2(b3, 3n) * b3) % P;
-  const b9 = (pow2(b6, 3n) * b3) % P;
-  const b11 = (pow2(b9, 2n) * b2) % P;
-  const b22 = (pow2(b11, 11n) * b11) % P;
-  const b44 = (pow2(b22, 22n) * b22) % P;
-  const b88 = (pow2(b44, 44n) * b44) % P;
-  const b176 = (pow2(b88, 88n) * b88) % P;
-  const b220 = (pow2(b176, 44n) * b44) % P;
-  const b223 = (pow2(b220, 3n) * b3) % P;
-  const t1 = (pow2(b223, 23n) * b22) % P;
-  const t2 = (pow2(t1, 6n) * b2) % P;
+  const b2 = (x * x * x) % CURVE.P; // x^3, 11
+  const b3 = (b2 * b2 * x) % CURVE.P; // x^7
+  const b6 = (pow2(b3, 3n) * b3) % CURVE.P;
+  const b9 = (pow2(b6, 3n) * b3) % CURVE.P;
+  const b11 = (pow2(b9, 2n) * b2) % CURVE.P;
+  const b22 = (pow2(b11, 11n) * b11) % CURVE.P;
+  const b44 = (pow2(b22, 22n) * b22) % CURVE.P;
+  const b88 = (pow2(b44, 44n) * b44) % CURVE.P;
+  const b176 = (pow2(b88, 88n) * b88) % CURVE.P;
+  const b220 = (pow2(b176, 44n) * b44) % CURVE.P;
+  const b223 = (pow2(b220, 3n) * b3) % CURVE.P;
+  const t1 = (pow2(b223, 23n) * b22) % CURVE.P;
+  const t2 = (pow2(t1, 6n) * b2) % CURVE.P;
   return pow2(t2, 2n);
 }
 
@@ -718,14 +721,15 @@ function invert(number: bigint, modulo: bigint = CURVE.P): bigint {
     [x, y] = [u, v];
     [u, v] = [m, n];
   }
-  if (b !== 1n) throw new Error('invert: does not exist');
+  const gcd = b;
+  if (gcd !== 1n) throw new Error('invert: does not exist');
   return mod(x, modulo);
 }
 
 // Takes a bunch of numbers, inverses all of them
 function invertBatch(nums: bigint[], n: bigint = CURVE.P): bigint[] {
   const len = nums.length;
-  const scratch = new Array(len);
+  const scratch = new Array<bigint>(len);
   let acc = 1n;
   for (let i = 0; i < len; i++) {
     if (nums[i] === 0n) continue;
@@ -742,7 +746,7 @@ function invertBatch(nums: bigint[], n: bigint = CURVE.P): bigint[] {
   return nums;
 }
 
-const divNearest = (a: bigint, b: bigint) => (a + (b >> 1n)) / b;
+const divNearest = (a: bigint, b = CURVE.n) => (a + (b >> 1n)) / b;
 const POW_2_128 = 2n ** 128n;
 // Split 256-bit K into 2 128-bit (k1, k2) for which k1 + k2 * lambda = K.
 // Used for endomorphism https://gist.github.com/paulmillr/eb670806793e84df628a7c434a873066
@@ -752,8 +756,8 @@ function splitScalarEndo(k: bigint): [boolean, bigint, boolean, bigint] {
   const b1 = -0xe4437ed6010e88286f547fa90abfe4c3n;
   const a2 = 0x114ca50f7a8e2f3f657c1108d9d44cfd8n;
   const b2 = a1;
-  const c1 = divNearest(b2 * k, n);
-  const c2 = divNearest(-b1 * k, n);
+  const c1 = divNearest(b2 * k);
+  const c2 = divNearest(-b1 * k);
   let k1 = mod(k - c1 * a1 - c2 * a2, n);
   let k2 = mod(-c1 * b1 - c2 * b2, n);
   const k1neg = k1 > POW_2_128;
@@ -828,8 +832,7 @@ async function getQRSrfc6979(msgHash: Hex, privateKey: PrivKey): Promise<QRS> {
 function getQRSrfc6979Sync(msgHash: Hex, privateKey: PrivKey): QRS {
   const privKey = normalizePrivateKey(privateKey);
   let [h1, h1n, x, v, k, b0, b1] = _abc6979(msgHash, privKey);
-  const hmac = utils.hmacSha256Sync;
-  if (!hmac) throw new Error('utils.hmacSha256Sync is undefined, you need to set it');
+  const hmac = utils.hmacSha256 as any as (key: U8A, ...m: U8A[]) => U8A;
   // Steps D, E, F, G
   k = hmac(k, v, b0, x, h1);
   if (k instanceof Promise) throw new Error('To use sync sign(), ensure utils.hmacSha256 is sync');
@@ -882,21 +885,11 @@ function normalizePrivateKey(key: PrivKey): bigint {
 }
 
 function normalizePublicKey(publicKey: PubKey): Point {
-  if (publicKey instanceof Point) {
-    publicKey.assertValidity();
-    return publicKey;
-  } else {
-    return Point.fromHex(publicKey);
-  }
+  return publicKey instanceof Point ? publicKey : Point.fromHex(publicKey);
 }
 
 function normalizeSignature(signature: Sig): Signature {
-  if (signature instanceof Signature) {
-    signature.assertValidity();
-    return signature;
-  } else {
-    return Signature.fromDER(signature);
-  }
+  return signature instanceof Signature ? signature : Signature.fromHex(signature);
 }
 
 export function getPublicKey(
@@ -949,15 +942,15 @@ export function getSharedSecret(privateA: PrivKey, publicB: PubKey, isCompressed
     : shared.toRawBytes(isCompressed);
 }
 
-type OptsRecov = { recovered: true; canonical?: true; der?: boolean };
-type OptsNoRecov = { recovered?: false; canonical?: true; der?: boolean };
-type Opts = { recovered?: boolean; canonical?: true; der?: boolean };
+type OptsRecov = { recovered: true; canonical?: true };
+type OptsNoRecov = { recovered?: false; canonical?: true };
+type Opts = { recovered?: boolean; canonical?: true };
 type SignOutput = Hex | [Hex, number];
 
 // We don't overload function because the overload won't be externally visible
 function QRSToSig(qrs: QRS, opts: OptsNoRecov | OptsRecov, str = false): SignOutput {
   const [q, r, s] = qrs;
-  let { canonical, der, recovered } = opts; // default der is true
+  let { canonical, recovered } = opts;
   let recovery = (q.x === r ? 0 : 2) | Number(q.y & 1n);
   let adjustedS = s;
   const HIGH_NUMBER = CURVE.n >> 1n;
@@ -966,9 +959,7 @@ function QRSToSig(qrs: QRS, opts: OptsNoRecov | OptsRecov, str = false): SignOut
     recovery ^= 1;
   }
   const sig = new Signature(r, adjustedS);
-  sig.assertValidity();
-  const hex = der === false ? sig.toCompactHex() : sig.toDERHex();
-  const hashed = str ? hex : hexToBytes(hex);
+  const hashed = str ? sig.toHex() : sig.toRawBytes();
   return recovered ? [hashed, recovery] : hashed;
 }
 
@@ -983,22 +974,23 @@ async function sign(msgHash: Hex, privKey: PrivKey, opts: Opts = {}): Promise<Si
   return QRSToSig(await getQRSrfc6979(msgHash, privKey), opts, typeof msgHash === 'string');
 }
 
-function signSync(msgHash: U8A, privKey: PrivKey, opts: OptsRecov): [U8A, number];
-function signSync(msgHash: string, privKey: PrivKey, opts: OptsRecov): [string, number];
-function signSync(msgHash: U8A, privKey: PrivKey, opts?: OptsNoRecov): U8A;
-function signSync(msgHash: string, privKey: PrivKey, opts?: OptsNoRecov): string;
-function signSync(msgHash: string, privKey: PrivKey, opts?: OptsNoRecov): string;
-function signSync(msgHash: Hex, privKey: PrivKey, opts: Opts = {}): SignOutput {
+// Ugly hack; for cases when sync utils.hmacSha256() is the requirement.
+function _syncSign(msgHash: U8A, privKey: PrivKey, opts: OptsRecov): [U8A, number];
+function _syncSign(msgHash: string, privKey: PrivKey, opts: OptsRecov): [string, number];
+function _syncSign(msgHash: U8A, privKey: PrivKey, opts?: OptsNoRecov): U8A;
+function _syncSign(msgHash: string, privKey: PrivKey, opts?: OptsNoRecov): string;
+function _syncSign(msgHash: string, privKey: PrivKey, opts?: OptsNoRecov): string;
+function _syncSign(msgHash: Hex, privKey: PrivKey, opts: Opts = {}): SignOutput {
   return QRSToSig(getQRSrfc6979Sync(msgHash, privKey), opts, typeof msgHash === 'string');
 }
-export { sign, signSync };
+export { sign, _syncSign };
 
 // https://www.secg.org/sec1-v2.pdf, section 4.1.4
 export function verify(signature: Sig, msgHash: Hex, publicKey: PubKey): boolean {
   const { n } = CURVE;
-  let sig;
+  const sig = normalizeSignature(signature);
   try {
-    sig = normalizeSignature(signature);
+    sig.assertValidity();
   } catch (error) {
     return false;
   }
@@ -1032,13 +1024,13 @@ async function createChallenge(x: bigint, P: Point, message: Uint8Array) {
   return mod(t, CURVE.n);
 }
 
-function hasOddY(point: Point): bigint {
-  return (point.y & 1n);
+function hasOddY(point: Point) {
+  return (point.y & 0b1n);
 }
 
 class SchnorrSignature {
   constructor(readonly r: bigint, readonly s: bigint) {
-    if (r <= 0n || s <= 0n || r >= CURVE.P || s >= CURVE.n) throw new Error('Invalid signature');
+    if (r === 0n || s === 0n || r >= CURVE.P || s >= CURVE.n) throw new Error('Invalid signature');
   }
   static fromHex(hex: Hex) {
     const bytes = ensureBytes(hex);
@@ -1107,8 +1099,6 @@ async function schnorrSign(
   return typeof msgHash === 'string' ? sig.toHex() : sig.toRawBytes();
 }
 
-// no schnorrSignSync() for now
-
 // Also used in sign() function.
 async function schnorrVerify(signature: Hex, msgHash: Hex, publicKey: Hex): Promise<boolean> {
   const sig =
@@ -1137,18 +1127,6 @@ export const schnorr = {
 // Enable precomputes. Slows down first publicKey computation by 20ms.
 Point.BASE._setWindowSize(8);
 
-type Sha256FnSync = undefined | ((...messages: Uint8Array[]) => Uint8Array);
-type HmacFnSync = undefined | ((key: Uint8Array, ...messages: Uint8Array[]) => Uint8Array);
-
-const crypto: { node?: any; web?: Crypto } = (() => {
-  const webCrypto = typeof self === 'object' && 'crypto' in self ? self.crypto : undefined;
-  const nodeRequire = typeof module !== 'undefined' && typeof require === 'function';
-  return {
-    node: nodeRequire && !webCrypto ? require('crypto') : undefined,
-    web: webCrypto,
-  };
-})();
-
 export const utils = {
   isValidPrivateKey(privateKey: PrivKey) {
     try {
@@ -1160,10 +1138,14 @@ export const utils = {
   },
 
   randomBytes: (bytesLength: number = 32): Uint8Array => {
-    if (crypto.web) {
-      return crypto.web.getRandomValues(new Uint8Array(bytesLength));
-    } else if (crypto.node) {
-      const { randomBytes } = crypto.node;
+    // @ts-ignore
+    if (typeof self == 'object' && 'crypto' in self) {
+      // @ts-ignore
+      return self.crypto.getRandomValues(new Uint8Array(bytesLength));
+      // @ts-ignore
+    } else if (typeof process === 'object' && 'node' in process.versions) {
+      // @ts-ignore
+      const { randomBytes } = require('crypto');
       return new Uint8Array(randomBytes(bytesLength).buffer);
     } else {
       throw new Error("The environment doesn't have randomBytes function");
@@ -1177,17 +1159,22 @@ export const utils = {
     while (i--) {
       const b32 = utils.randomBytes(32);
       const num = bytesToNumber(b32);
-      if (isWithinCurveOrder(num) && num !== 1n) return b32;
+      if (num > 1n && num < CURVE.n) return b32;
     }
     throw new Error('Valid private key was not found in 8 iterations. PRNG is broken');
   },
 
   sha256: async (message: Uint8Array): Promise<Uint8Array> => {
-    if (crypto.web) {
-      const buffer = await crypto.web.subtle.digest('SHA-256', message.buffer);
+    // @ts-ignore
+    if (typeof self == 'object' && 'crypto' in self) {
+      // @ts-ignore
+      const buffer = await self.crypto.subtle.digest('SHA-256', message.buffer);
+      // @ts-ignore
       return new Uint8Array(buffer);
-    } else if (crypto.node) {
-      const { createHash } = crypto.node;
+      // @ts-ignore
+    } else if (typeof process === 'object' && 'node' in process.versions) {
+      // @ts-ignore
+      const { createHash } = require('crypto');
       return Uint8Array.from(createHash('sha256').update(message).digest());
     } else {
       throw new Error("The environment doesn't have sha256 function");
@@ -1195,8 +1182,10 @@ export const utils = {
   },
 
   hmacSha256: async (key: Uint8Array, ...messages: Uint8Array[]): Promise<Uint8Array> => {
-    if (crypto.web) {
-      const ckey = await crypto.web.subtle.importKey(
+    // @ts-ignore
+    if (typeof self == 'object' && 'crypto' in self) {
+      // @ts-ignore
+      const ckey = await self.crypto.subtle.importKey(
         'raw',
         key,
         { name: 'HMAC', hash: { name: 'SHA-256' } },
@@ -1204,10 +1193,13 @@ export const utils = {
         ['sign']
       );
       const message = concatBytes(...messages);
-      const buffer = await crypto.web.subtle.sign('HMAC', ckey, message);
+      // @ts-ignore
+      const buffer = await self.crypto.subtle.sign('HMAC', ckey, message);
       return new Uint8Array(buffer);
-    } else if (crypto.node) {
-      const { createHmac } = crypto.node;
+      // @ts-ignore
+    } else if (typeof process === 'object' && 'node' in process.versions) {
+      // @ts-ignore
+      const { createHmac } = require('crypto');
       const hash = createHmac('sha256', key);
       for (let message of messages) {
         hash.update(message);
@@ -1217,9 +1209,6 @@ export const utils = {
       throw new Error("The environment doesn't have hmac-sha256 function");
     }
   },
-
-  sha256Sync: undefined as Sha256FnSync,
-  hmacSha256Sync: undefined as HmacFnSync,
 
   precompute(windowSize = 8, point = Point.BASE): Point {
     const cached = point === Point.BASE ? point : new Point(point.x, point.y);
